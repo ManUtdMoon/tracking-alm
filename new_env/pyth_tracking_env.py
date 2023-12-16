@@ -193,11 +193,11 @@ class PathTrackingEnv(gym.Env):
         veh_len = 4.8
         veh_wid = 2.0
 
-        ax = plt.axes(xlim=(ego_x - 80, ego_x + 80), ylim=(ego_y - 20, ego_y + 20))
+        ax = plt.axes(xlim=(ego_x - 30, ego_x + 60), ylim=(ego_y - 20, ego_y + 20))
         ax.set_aspect('equal')
         plt.axis('off')
 
-        x_range = np.linspace(ego_x - 20, ego_x + 80, 100)
+        x_range = np.linspace(ego_x - 20, ego_x + 50, 100)
         y_range = [self.path.compute_path_y(x) for x in x_range]
 
         ax.add_patch(pc.Rectangle(

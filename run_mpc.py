@@ -13,11 +13,12 @@ policy.tunable_para_unmapped = np.array([
 
 
 # run the environment with the policy in a for loop
-for i in range(1000):
+for i in range(1):
     state = env.reset()
     done = False
     while not done:
-        action, _ = policy.get_action(state)
+        action, _ = policy.get_action_alm(state)
         state, _, done, _ = env.step(action)
         env.render()
 
+print("Done!")

@@ -2,7 +2,7 @@ import random
 import math
 import numpy as np
 import casadi
-
+np.set_printoptions(precision=4)
 
 class ModelPredictiveController(object):
     def __init__(self, env, seed):
@@ -161,22 +161,23 @@ class ModelPredictiveController(object):
     
     def get_action_alm(self, initial_state):
         # ALM-related parameters
-        rho = 1.0 # penalty parameter
-        rho_amplifier = 5.0 # rho amplification factor
+        rho = 10.0 # penalty parameter
+        rho_amplifier = 10.0 # rho amplification factor
         lam = np.zeros(self.Np * 6, dtype=np.float32).reshape(-1, 1) # Lagrangian multipliers
 
-        max_lam_iter = 20
+        max_lam_iter = 100
         
-        last_us = np.zeros(2*self.Np, dtype=np.float32)
+        last_us = np.zeros(self.Np * 2, dtype=np.float32).reshape(-1, 1)
         us_error = np.inf
-        us_error_threshold = 1e-2
+        us_error_threshold = 1e-3
 
         max_violation = np.inf
-        max_violation_threshold = 1e-3
+        max_violation_threshold = 1e-4
         
         # outer loop for ALM
         for alm_iter in range(max_lam_iter):
             if us_error < us_error_threshold and max_violation < max_violation_threshold:
+                print("----------")
                 break
 
             self.ref_p = []
@@ -234,14 +235,57 @@ class ModelPredictiveController(object):
                 act_cost *= casadi.power(self.gamma, k-1)
                 J += (ref_cost + act_cost)
 
-            # put dynamics constraints into lagrangian
+                # put dynamics constraints into lagrangian
+                lam_now = lam[(k-1)*6 : k*6, :]
+                violation_now = Fk - Xk
+
+                J += casadi.dot(lam_now, violation_now) + rho / 2. * casadi.sum1(casadi.power(violation_now, 2))
         
-            nlp = dict(f=J, g=casadi.vertcat(*G), x=casadi.vertcat(*w), p=casadi.vertcat(*ref_list))
+            nlp = dict(f=J, x=casadi.vertcat(*w), p=casadi.vertcat(*ref_list))
             S = casadi.nlpsol('S', 'ipopt', nlp,
-                            {'ipopt.max_iter': 200, 'ipopt.print_level': 0, 'ipopt.sb': 'yes', 'print_time': 0})
-            r = S(lbx=lbw, ubx=ubw, x0=self.x0, lbg=lbg, ubg=ubg, p=self.ref_p)
+                            {'ipopt.max_iter': 100, 'ipopt.print_level': 0, 'ipopt.sb': 'yes', 'print_time': 0})
+            r = S(lbx=lbw, ubx=ubw, x0=self.x0, p=self.ref_p)
             X = np.array(r['x']).tolist()
             action = np.array([X[6][0], X[7][0]])
             self.x0 = casadi.DM(
                 X[8:] + X[-8] + X[-7] + X[-6] + X[-5] + X[-4] + X[-3] + X[-2] + X[-1]
             )  # warm start for faster optimization
+
+            # update Lagrangian multipliers
+            ## current constraint violation
+            sol = np.array(X).reshape(-1)
+            xs, us, x_gts = [], [], []
+
+            for k in range(1, self.Np + 1):
+                u_sol = sol[8*k-2 : 8*k]
+                x_sol = sol[8*k : 8*k+6]
+                x_last = sol[8*(k-1) : 8*k-2]
+                x_gt = self.step_forward(x_last, u_sol)
+
+                us.append(u_sol) # (2,)
+                xs.append(x_sol) # (6,)
+                x_gts.append(x_gt) # (6,)
+            
+            xs = np.array(xs).reshape(-1, 1)
+            x_gts = np.array(x_gts).reshape(-1, 1)
+            us = np.array(us).reshape(-1, 1)
+
+            violation = x_gts - xs
+            lam = lam + rho * violation
+            rho *= rho_amplifier
+
+            us_error = np.abs(us - last_us).max()
+            last_us = us
+            max_violation = np.abs(violation).max()
+
+            assert us.shape == (2*self.Np, 1)
+            assert violation.shape == (6*self.Np, 1)
+            assert lam.shape == (6*self.Np, 1)
+
+            print(f"ALM iteration {alm_iter}: us_error {us_error:.4f}, max_violation {max_violation:.5f}, lam: {lam.reshape(-1)[-5:]}")
+
+        else:
+            print(f"reach max iteration {max_lam_iter} for ALM")
+
+        return action, np.array(X[8:14])
+            
