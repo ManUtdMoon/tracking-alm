@@ -158,3 +158,90 @@ class ModelPredictiveController(object):
         self.x0 = casadi.DM(
             X[8:] + X[-8] + X[-7] + X[-6] + X[-5] + X[-4] + X[-3] + X[-2] + X[-1])  # warm start for faster optimization
         return action, np.array(X[8:14])
+    
+    def get_action_alm(self, initial_state):
+        # ALM-related parameters
+        rho = 1.0 # penalty parameter
+        rho_amplifier = 5.0 # rho amplification factor
+        lam = np.zeros(self.Np * 6, dtype=np.float32).reshape(-1, 1) # Lagrangian multipliers
+
+        max_lam_iter = 20
+        
+        last_us = np.zeros(2*self.Np, dtype=np.float32)
+        us_error = np.inf
+        us_error_threshold = 1e-2
+
+        max_violation = np.inf
+        max_violation_threshold = 1e-3
+        
+        # outer loop for ALM
+        for alm_iter in range(max_lam_iter):
+            if us_error < us_error_threshold and max_violation < max_violation_threshold:
+                break
+
+            self.ref_p = []
+            x = casadi.SX.sym('x', 6)
+            u = casadi.SX.sym('u', 2)
+            # Create empty NLP
+            w = []
+            lbw = []
+            ubw = []
+            lbg = []
+            ubg = []
+            ref_list = []
+            G = []
+            J = 0
+            Xk = casadi.MX.sym('X0', 6)
+            w += [Xk]
+            lbw += [initial_state[0], initial_state[1], initial_state[2], initial_state[3], initial_state[4],
+                    initial_state[5]]
+            ubw += [initial_state[0], initial_state[1], initial_state[2], initial_state[3], initial_state[4],
+                    initial_state[5]]
+            for k in range(1, self.Np + 1):
+                f = casadi.vertcat(*self.step_forward(x, u))
+                F = casadi.Function("F", [x, u], [f])
+                Uname = 'U' + str(k - 1)
+                Uk = casadi.MX.sym(Uname, 2)
+                w += [Uk]
+                lbw += [self.action_space.low[0], self.action_space.low[1]]
+                ubw += [self.action_space.high[0], self.action_space.high[1]]
+                Fk = F(Xk, Uk)
+                Xname = 'X' + str(k)
+                Xk = casadi.MX.sym(Xname, 6)
+                w += [Xk]
+                ubw += [casadi.inf, casadi.inf, casadi.inf, casadi.inf, casadi.inf, casadi.inf]
+                lbw += [-casadi.inf, -casadi.inf, -casadi.inf, -casadi.inf, -casadi.inf, -casadi.inf]
+                # dynamic_state: x, u, v, yaw, y, phi
+                G += [Fk - Xk]
+                ubg += [0., 0., 0., 0., 0., 0.]
+                lbg += [0., 0., 0., 0., 0., 0.]
+                REFname = 'REF' + str(k)
+                REFk = casadi.MX.sym(REFname, 3)
+                ref_list += [REFk]
+                self.ref_p += [initial_state[6 + (k - 1) * 3], initial_state[6 + (k - 1) * 3 + 1],
+                            initial_state[6 + (k - 1) * 3 + 2]]
+            
+                ref_cost = 1.0 * casadi.power(w[k * 2][1] - self.u_target, 2)  # u
+                ref_cost += self.tunable_para_unmapped[6] * casadi.power(w[k * 2][0] - ref_list[k - 1][0], 2)  # x
+                ref_cost += self.tunable_para_unmapped[7] * casadi.power(w[k * 2][4] - ref_list[k - 1][1], 2)  # y
+                ref_cost += self.tunable_para_unmapped[8] * casadi.power(w[k * 2][5] - ref_list[k - 1][2], 2)  # phi
+                ref_cost += self.tunable_para_unmapped[9] * casadi.power(w[k * 2][2], 2)  # v
+                ref_cost += self.tunable_para_unmapped[10] * casadi.power(w[k * 2][3], 2)  # yaw
+                ref_cost *= casadi.power(self.gamma, k)
+            
+                act_cost = self.tunable_para_unmapped[11] * casadi.power(w[k * 2 - 1][0], 2)  # steer
+                act_cost += self.tunable_para_unmapped[12] * casadi.power(w[k * 2 - 1][1], 2)  # ax
+                act_cost *= casadi.power(self.gamma, k-1)
+                J += (ref_cost + act_cost)
+
+            # put dynamics constraints into lagrangian
+        
+            nlp = dict(f=J, g=casadi.vertcat(*G), x=casadi.vertcat(*w), p=casadi.vertcat(*ref_list))
+            S = casadi.nlpsol('S', 'ipopt', nlp,
+                            {'ipopt.max_iter': 200, 'ipopt.print_level': 0, 'ipopt.sb': 'yes', 'print_time': 0})
+            r = S(lbx=lbw, ubx=ubw, x0=self.x0, lbg=lbg, ubg=ubg, p=self.ref_p)
+            X = np.array(r['x']).tolist()
+            action = np.array([X[6][0], X[7][0]])
+            self.x0 = casadi.DM(
+                X[8:] + X[-8] + X[-7] + X[-6] + X[-5] + X[-4] + X[-3] + X[-2] + X[-1]
+            )  # warm start for faster optimization
