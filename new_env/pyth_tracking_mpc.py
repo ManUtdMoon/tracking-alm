@@ -11,6 +11,8 @@ class ModelPredictiveController(object):
         self.Np = env.Np
         self.step_T = env.step_T
         self.action_space = env.action_space
+        self.action_lb = env.action_space.low.reshape(-1, 1)
+        self.action_ub = env.action_space.high.reshape(-1, 1)
         self.u_target = env.u_target
         self.path = env.path
         # Tunable parameters (19):
@@ -163,16 +165,18 @@ class ModelPredictiveController(object):
         # ALM-related parameters
         rho = 10.0 # penalty parameter
         rho_amplifier = 10.0 # rho amplification factor
-        lam = np.zeros(self.Np * 6, dtype=np.float32).reshape(-1, 1) # Lagrangian multipliers
+        lam = np.zeros(self.Np * 6, dtype=np.float32).reshape(-1, 1) # Lagrangian multipliers for dynamics
+        lam_lb = np.zeros(self.Np * 2, dtype=np.float32).reshape(-1, 1) # for action lb: lb - u <0
+        lam_ub = np.zeros(self.Np * 2, dtype=np.float32).reshape(-1, 1) # for action lb: u - ub <0
 
         max_lam_iter = 100
         
         last_us = np.zeros(self.Np * 2, dtype=np.float32).reshape(-1, 1)
         us_error = np.inf
-        us_error_threshold = 1e-3
+        us_error_threshold = 1e-4
 
         max_violation = np.inf
-        max_violation_threshold = 1e-4
+        max_violation_threshold = 1e-5
         
         # outer loop for ALM
         for alm_iter in range(max_lam_iter):
@@ -204,8 +208,8 @@ class ModelPredictiveController(object):
                 Uname = 'U' + str(k - 1)
                 Uk = casadi.MX.sym(Uname, 2)
                 w += [Uk]
-                lbw += [self.action_space.low[0], self.action_space.low[1]]
-                ubw += [self.action_space.high[0], self.action_space.high[1]]
+                lbw += [-casadi.inf, -casadi.inf]
+                ubw += [casadi.inf, casadi.inf]
                 Fk = F(Xk, Uk)
                 Xname = 'X' + str(k)
                 Xk = casadi.MX.sym(Xname, 6)
@@ -236,10 +240,17 @@ class ModelPredictiveController(object):
                 J += (ref_cost + act_cost)
 
                 # put dynamics constraints into lagrangian
-                lam_now = lam[(k-1)*6 : k*6, :]
-                violation_now = Fk - Xk
+                lam_dynamics_now = lam[(k-1)*6 : k*6, :]
+                lam_lb_now = lam_lb[(k-1)*2 : k*2, :]
+                lam_ub_now = lam_ub[(k-1)*2 : k*2, :]
 
-                J += casadi.dot(lam_now, violation_now) + rho / 2. * casadi.sum1(casadi.power(violation_now, 2))
+                violation_dynamics = Fk - Xk
+                violation_lb = casadi.fmax(self.action_lb - Uk, np.zeros((2,1), dtype=np.float32))
+                violation_ub = casadi.fmax(Uk - self.action_ub, np.zeros((2,1), dtype=np.float32))
+
+                J += casadi.dot(lam_dynamics_now, violation_dynamics) + rho / 2. * casadi.sum1(casadi.power(violation_dynamics, 2))
+                J += casadi.dot(lam_lb_now, self.action_lb - Uk) + rho / 2. * casadi.sum1(casadi.power(violation_lb, 2))
+                J += casadi.dot(lam_ub_now, Uk - self.action_ub) + rho / 2. * casadi.sum1(casadi.power(violation_ub, 2))
         
             nlp = dict(f=J, x=casadi.vertcat(*w), p=casadi.vertcat(*ref_list))
             S = casadi.nlpsol('S', 'ipopt', nlp,
@@ -270,19 +281,29 @@ class ModelPredictiveController(object):
             x_gts = np.array(x_gts).reshape(-1, 1)
             us = np.array(us).reshape(-1, 1)
 
+            ulbs = np.array([self.action_lb] * self.Np).reshape(-1, 1)
+            uubs = np.array([self.action_ub] * self.Np).reshape(-1, 1)
+
             violation = x_gts - xs
             lam = lam + rho * violation
+
+            violation_lb = ulbs - us
+            violation_ub = us - uubs
+            lam_lb = np.maximum(lam_lb + rho * violation_lb, 0.)
+            lam_ub = np.maximum(lam_ub + rho * violation_ub, 0.)
             rho *= rho_amplifier
 
             us_error = np.abs(us - last_us).max()
             last_us = us
-            max_violation = np.abs(violation).max()
+
+            max_violation = np.max(np.array([np.abs(violation).max(), violation_lb.max(), violation_ub.max()]))
 
             assert us.shape == (2*self.Np, 1)
             assert violation.shape == (6*self.Np, 1)
             assert lam.shape == (6*self.Np, 1)
 
-            print(f"ALM iteration {alm_iter}: us_error {us_error:.4f}, max_violation {max_violation:.5f}, lam: {lam.reshape(-1)[-5:]}")
+            print(f"ALM iteration {alm_iter}: us_error {us_error:.6f}, max_violation {max_violation:.6f}")
+            print(f"lam: {lam.reshape(-1)[-5:]}, lam_lb: {lam_lb.reshape(-1)[:5]}, lam_ub: {lam_ub.reshape(-1)[:5]}")
 
         else:
             print(f"reach max iteration {max_lam_iter} for ALM")
