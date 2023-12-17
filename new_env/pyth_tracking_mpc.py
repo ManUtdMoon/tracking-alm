@@ -177,6 +177,15 @@ class ModelPredictiveController(object):
 
         max_violation = np.inf
         max_violation_threshold = 1e-5
+
+        alm_per_step = {
+            "obj_aug_term": [],
+            "obj_primal": [],
+            "max_violation_dyanmics": [],
+            "max_violation_lb": [],
+            "max_violation_ub": [],
+            "cost": [],
+        }
         
         # outer loop for ALM
         for alm_iter in range(max_lam_iter):
@@ -285,13 +294,9 @@ class ModelPredictiveController(object):
             uubs = np.array([self.action_ub] * self.Np).reshape(-1, 1)
 
             violation = x_gts - xs
-            lam = lam + rho * violation
 
             violation_lb = ulbs - us
             violation_ub = us - uubs
-            lam_lb = np.maximum(lam_lb + rho * violation_lb, 0.)
-            lam_ub = np.maximum(lam_ub + rho * violation_ub, 0.)
-            rho *= rho_amplifier
 
             us_error = np.abs(us - last_us).max()
             last_us = us
@@ -302,11 +307,59 @@ class ModelPredictiveController(object):
             assert violation.shape == (6*self.Np, 1)
             assert lam.shape == (6*self.Np, 1)
 
+            alm_per_step["obj_aug_term"].append(np.dot(lam.reshape(-1), violation.reshape(-1))
+                + np.dot(lam_lb.reshape(-1), violation_lb.reshape(-1))
+                + np.dot(lam_ub.reshape(-1), violation_ub.reshape(-1))
+                + rho / 2. * (np.sum(violation**2) 
+                              + np.sum(np.maximum(violation_lb, 0)**2)
+                              + np.sum(np.maximum(violation_ub, 0)**2))
+            )
+            alm_per_step["obj_primal"].append(np.array(r['f']).item() - alm_per_step["obj_aug_term"][-1])
+            alm_per_step["max_violation_dyanmics"].append(np.abs(violation).max())
+            alm_per_step["max_violation_lb"].append(violation_lb.max())
+            alm_per_step["max_violation_ub"].append(violation_ub.max())
+
+            cost = 0
+            for i in range(self.Np):
+                xx = xs[i*6 : (i+1)*6, :].reshape(-1)
+                uu = us[i*2 : (i+1)*2, :].reshape(-1)
+
+                act_cost = self.tunable_para_unmapped[11] * uu[0]**2  # steer
+                act_cost += self.tunable_para_unmapped[12] * uu[1]**2
+                cost += act_cost * self.gamma**(i+1)
+
+                ref_point = np.array([self.ref_p[i*3], self.ref_p[i*3+1], self.ref_p[i*3+2]])
+                x, y, phi = xx[0], xx[4], xx[5]
+                ref_x, ref_y, ref_phi = ref_point[0], ref_point[1], ref_point[2]
+                ref_cost = self.tunable_para_unmapped[6] * (x - ref_x)**2
+                ref_cost += self.tunable_para_unmapped[7] * (y - ref_y)**2
+                ref_cost += self.tunable_para_unmapped[8] * (phi - ref_phi)**2
+                ref_cost += self.tunable_para_unmapped[9] * xx[2]**2
+                ref_cost += self.tunable_para_unmapped[10] * xx[3]**2
+                ref_cost += 1.0 * (xx[1]-self.u_target)**2
+                cost += ref_cost * self.gamma**i
+            alm_per_step["cost"].append(cost)
+                
+
+            lam = lam + rho * violation
+            lam_lb = np.maximum(lam_lb + rho * violation_lb, 0.)
+            lam_ub = np.maximum(lam_ub + rho * violation_ub, 0.)
+            rho *= rho_amplifier
+
             print(f"ALM iteration {alm_iter}: us_error {us_error:.6f}, max_violation {max_violation:.6f}")
             print(f"lam: {lam.reshape(-1)[-5:]}, lam_lb: {lam_lb.reshape(-1)[:5]}, lam_ub: {lam_ub.reshape(-1)[:5]}")
 
         else:
             print(f"reach max iteration {max_lam_iter} for ALM")
 
-        return action, np.array(X[8:14])
+        # store per-step alm result
+        opt_result = {}
+        opt_result["num_iteration"] = alm_iter + 1
+        opt_result["u"] = action
+        opt_result["x"] = np.array(initial_state[0:6]).reshape(-1)
+        opt_result["x_ref"] = np.array(initial_state[6:9]).reshape(-1)
+        opt_result["x_next"] = np.array(X[8:14]).reshape(-1)
+        opt_result["alm_process"] = alm_per_step
+
+        return action, opt_result
             

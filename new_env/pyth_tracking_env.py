@@ -193,7 +193,7 @@ class PathTrackingEnv(gym.Env):
         veh_len = 4.8
         veh_wid = 2.0
 
-        ax = plt.axes(xlim=(ego_x - 30, ego_x + 60), ylim=(ego_y - 20, ego_y + 20))
+        ax = plt.axes(xlim=(ego_x - 20, ego_x + 50), ylim=(ego_y - 20, ego_y + 20))
         ax.set_aspect('equal')
         plt.axis('off')
 
@@ -207,8 +207,14 @@ class PathTrackingEnv(gym.Env):
 
         ax.plot(x_range, y_range, 'k', linewidth=2)
 
+        ref_points = self.ref_points.reshape(-1, 3)
+        ref_x = [point[0] for point in ref_points]
+        ref_y = [point[1] for point in ref_points]
+        ax.scatter(ref_x, ref_y, color='g', s=10)
+
         plt.tight_layout()
         plt.pause(0.01)
+        # plt.savefig(f'./imgs/{self.steps}.pdf')
 
     def compute_ref_points(self, x0):
         ref_points = []
