@@ -106,7 +106,7 @@ print(alm_process["obj_aug_term"])
 # plot the iterations of each step
 plt.figure(figsize=(5, 2))
 steps = np.arange(1, len(exp)+1)
-plt.plot(steps, [d["num_iteration"] - 1 for d in exp], "k-")
+plt.plot(steps, [d["num_iteration"] for d in exp], "k-")
 plt.xlabel("Time step")
 plt.ylabel("Number of iterations")
 plt.tight_layout()

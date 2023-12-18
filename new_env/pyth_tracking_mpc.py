@@ -354,7 +354,7 @@ class ModelPredictiveController(object):
 
         # store per-step alm result
         opt_result = {}
-        opt_result["num_iteration"] = alm_iter + 1
+        opt_result["num_iteration"] = alm_iter
         opt_result["u"] = action
         opt_result["x"] = np.array(initial_state[0:6]).reshape(-1)
         opt_result["x_ref"] = np.array(initial_state[6:9]).reshape(-1)
