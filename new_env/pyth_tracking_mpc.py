@@ -1,7 +1,10 @@
 import random
 import math
 import numpy as np
+import torch
+from copy import deepcopy
 import casadi
+
 np.set_printoptions(precision=4)
 
 class ModelPredictiveController(object):
@@ -11,80 +14,29 @@ class ModelPredictiveController(object):
         self.Np = env.Np
         self.step_T = env.step_T
         self.action_space = env.action_space
-        self.action_lb = env.action_space.low.reshape(-1, 1)
-        self.action_ub = env.action_space.high.reshape(-1, 1)
+        self.action_lb = torch.tensor(env.action_space.low)
+        self.action_ub = torch.tensor(env.action_space.high)
         self.u_target = env.u_target
         self.path = env.path
         # Tunable parameters (19):
         # model - Cf, Cr, a, b, m, Iz
         # stage cost - dx_w, dy_w, dphi_w, v_w, yaw_w, str_w, acc_w (du_w is set as 0.01) - log space
         # terminal cost - dx_w, dy_w, dphi_w, v_w, yaw_w, du_w - log space
-        self.tunable_para_high = np.array([-8e4, -8e4, 2.2, 2.2, 2000, 2000,
-                                           1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2,
-                                           1e2, 1e2, 1e2, 1e2, 1e2, 1e2])
-        self.tunable_para_low = np.array([-16e4, -16e4, 0.8, 0.8, 1000, 1000,
-                                          1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6,
-                                          1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6])
-        self.x0 = ([0, 0, 0, 0, 0, 0, 0, 0] * (self.Np + 1))
-        self.x0.pop(-1)
-        self.x0.pop(-1)
+        self.tunable_para_unmapped = torch.tensor([-128916, -85944, 1.06, 1.85, 1412, 1536.7], dtype=torch.float32)
+        self.Q_mat = torch.diag(torch.tensor([1.0, 1e-5, 1., 10., 30., 50.], dtype=torch.float32))
+        self.R_mat = torch.diag(torch.tensor([60., 1.], dtype=torch.float32))
+        # self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.x0 = torch.rand(8 * self.Np, dtype=torch.float32, requires_grad=True)
+        self.dim = len(self.x0)
         self.ref_p = None
-        self.lin_para_gain = 0.5 * (self.tunable_para_high[:6] - self.tunable_para_low[:6])
-        self.lin_para_bias = 0.5 * (self.tunable_para_high[:6] + self.tunable_para_low[:6])
-        self.log_para_gain = 0.5 * (np.log10(self.tunable_para_high[6:]) - np.log10(self.tunable_para_low[6:]))
-        self.log_para_bias = 0.5 * (np.log10(self.tunable_para_high[6:]) + np.log10(self.tunable_para_low[6:]))
-        self.tunable_para_mapped = np.random.uniform(-1, 1, 19)
-        self.tunable_para_unmapped = self.tunable_para_transform(self.tunable_para_mapped, after_map=True)
-        self.tunable_para_sigma = 0.01 * np.ones(19)
-        self.para_num = 19
-        self.model_para_num = 6
         self.gamma = 0.99
-
-    def tunable_para_transform(self, para_in, after_map):
-        if after_map:
-            lin_para_mapped = para_in[:6]
-            log_para_mapped = para_in[6:]
-            lin_para_unmapped = self.lin_para_gain * lin_para_mapped + self.lin_para_bias
-            log_para_unmapped = np.power(10, self.log_para_gain * log_para_mapped + self.log_para_bias)
-            para_out = np.concatenate((lin_para_unmapped, log_para_unmapped))
-        else:
-            lin_para_unmapped = para_in[:6]
-            log_para_unmapped = para_in[6:]
-            lin_para_mapped = (lin_para_unmapped - self.lin_para_bias) / self.lin_para_gain
-            log_para_mapped = (np.log10(log_para_unmapped) - self.log_para_bias) / self.log_para_gain
-            para_out = np.concatenate((lin_para_mapped, log_para_mapped))
-        return para_out
-
-    def get_flat_param(self, after_map=True):
-        if after_map:
-            return self.tunable_para_mapped
-        else:
-            return self.tunable_para_unmapped
-
-    def set_flat_param(self, para, after_map=True):
-        if after_map:
-            para = np.clip(para, -1., 1.)
-            self.tunable_para_mapped = para
-            para_unmapped = self.tunable_para_transform(para, after_map)
-            self.tunable_para_unmapped = para_unmapped
-        else:
-            para = np.clip(para, self.tunable_para_low, self.tunable_para_high)
-            self.tunable_para_unmapped = para
-            para_mapped = self.tunable_para_transform(para, after_map)
-            self.tunable_para_mapped = para_mapped
-
-    def get_flat_sigma(self):
-        return self.tunable_para_sigma
-
-    def set_flat_sigma(self, para):
-        self.tunable_para_sigma = np.clip(para, 1e-2, 0.2)
 
     def step_forward(self, state, action):
         x, v_x, v_y, r, y, phi = state[0], state[1], state[2], state[3], state[4], state[5]
         steer, a_x = action[0], action[1]
         C_f, C_r, a, b, mass, I_z = self.tunable_para_unmapped[:6].tolist()
         tau = self.step_T
-        next_state = [x + tau * (v_x * casadi.cos(phi) - v_y * casadi.sin(phi)),
+        next_state = torch.tensor([x + tau * (v_x * torch.cos(phi) - v_y * torch.sin(phi)),
                       v_x + tau * a_x,
                       (mass * v_y * v_x + tau * (a * C_f - b * C_r) * r -
                        tau * C_f * steer * v_x - tau * mass * (v_x ** 2) * r)
@@ -92,9 +44,46 @@ class ModelPredictiveController(object):
                       (I_z * r * v_x + tau * (a * C_f - b * C_r) * v_y
                        - tau * a * C_f * steer * v_x) /
                       (I_z * v_x - tau * ((a ** 2) * C_f + (b ** 2) * C_r)),
-                      y + tau * (v_x * casadi.sin(phi) + v_y * casadi.cos(phi)),
-                      phi + tau * r]
+                      y + tau * (v_x * torch.sin(phi) + v_y * torch.cos(phi)),
+                      phi + tau * r])
         return next_state
+    
+    def compute_cost(self, x):
+        cost = torch.tensor(0., dtype=torch.float32)
+        # optimized vector: u0, x1, u1, ..., xn-1, un-1, xn
+        last_state = torch.tensor(self.initial_state[:6], dtype=torch.float32)
+        for k in range(1, self.Np + 1):
+            # dynamic_state: x, u, v, yaw, y, phi
+            act = x[(k-1)*8: (k-1)*8+2]
+            act_cost = torch.matmul(act, torch.matmul(self.R_mat, act)) * (self.gamma ** (k-1))
+            cost += act_cost
+            ref = torch.tensor([
+                self.initial_state[6 + (k - 1) * 3], # x
+                self.u_target, # u
+                0., # v
+                0., # w
+                self.initial_state[6 + (k - 1) * 3 + 1], # y
+                self.initial_state[6 + (k - 1) * 3 + 2], # phi
+            ],
+            dtype=torch.float32).detach()
+            state = x[(k-1)*8+2: (k-1)*8+8]
+            state_cost = torch.matmul(state - ref, torch.matmul(self.Q_mat, state - ref)) * (self.gamma ** (k))
+            cost += state_cost
+            lam_dynamics_now = self.lam[(k-1)*6 : k*6]
+            lam_lb_now = self.lam_lb[(k-1)*2 : k*2]
+            lam_ub_now = self.lam_ub[(k-1)*2 : k*2]
+
+            violation_dynamics = self.step_forward(last_state, act) - state
+            violation_lb = torch.max(self.action_lb - act, torch.zeros(2, dtype=torch.float32))
+            violation_ub = torch.max(act - self.action_ub, torch.zeros(2, dtype=torch.float32))
+
+            cost += torch.dot(lam_dynamics_now, violation_dynamics) + self.rho / 2. * torch.linalg.norm(violation_dynamics) ** 2
+            last_state = state
+
+            cost += torch.dot(lam_lb_now, self.action_lb - act) + self.rho / 2. * torch.linalg.norm(violation_lb) ** 2
+            cost += torch.dot(lam_ub_now, act - self.action_ub) + self.rho / 2. * torch.linalg.norm(violation_ub) ** 2
+        return cost
+
 
     def get_action(self, initial_state):
         self.ref_p = []
@@ -212,7 +201,7 @@ class ModelPredictiveController(object):
             ubw += [initial_state[0], initial_state[1], initial_state[2], initial_state[3], initial_state[4],
                     initial_state[5]]
             for k in range(1, self.Np + 1):
-                f = casadi.vertcat(*self.step_forward(x, u))
+                f = casadi.vertcat(*self.step_forward_casadi(x, u))
                 F = casadi.Function("F", [x, u], [f])
                 Uname = 'U' + str(k - 1)
                 Uk = casadi.MX.sym(Uname, 2)
@@ -362,4 +351,139 @@ class ModelPredictiveController(object):
         opt_result["alm_process"] = alm_per_step
 
         return action, opt_result
+
+    def get_action_alm_gd(self, initial_state):
+        # ALM-related parameters
+        self.rho = 10.0 # penalty parameter
+        self.rho_amplifier = 10.0 # rho amplification factor
+        self.lam = torch.zeros(self.Np * 6, dtype=torch.float32) # Lagrangian multipliers for dynamics
+        self.lam_lb = torch.zeros(self.Np * 2, dtype=torch.float32) # for action lb: lb - u <0
+        self.lam_ub = torch.zeros(self.Np * 2, dtype=torch.float32) # for action lb: u - ub <0
+        self.initial_state = initial_state
+
+        max_lam_iter = 100
+        
+        last_us = np.zeros(self.Np * 2, dtype=np.float32)
+        us_error = np.inf
+        us_error_threshold = 1e-4
+
+        max_violation = np.inf
+        max_violation_threshold = 1e-5
+
+        alm_per_step = {
+            "obj_aug_term": [],
+            "obj_primal": [],
+            "max_violation_dyanmics": [],
+            "max_violation_lb": [],
+            "max_violation_ub": [],
+            "cost": [],
+        }
+
+        
+        # outer loop for ALM
+        for alm_iter in range(max_lam_iter):
+            if us_error < us_error_threshold and max_violation < max_violation_threshold:
+                print("----------")
+                break
+            # inner loop for Newton
+            max_iteration = 500
+            for iter in range(max_iteration):
+                # compute newton step and decrement
+                cost = self.compute_cost(self.x0)
+                g = torch.autograd.grad(cost, self.x0, retain_graph=True, create_graph=True)
+                # H = torch.zeros((self.dim, self.dim), dtype=torch.float32, requires_grad=False)
+                # for i in range(self.dim):
+                #     grad_item = g[0][i]
+                #     H[i] = torch.autograd.grad(grad_item, self.x0, retain_graph=True)[0]
+                # inv_H = torch.linalg.inv(H)
+                with torch.no_grad():
+                    # delta = - torch.matmul(inv_H, g[0])
+                    # lam_sq = - torch.matmul(g[0], delta)
+                    delta = -g[0]
+                    norm = torch.linalg.norm(delta)
+                    print(norm)
+                if norm < 1e-5:
+                    break
+                # backtracking line search
+                alpha, beta = 0.25, 0.8
+                t = 1
+                with torch.no_grad():
+                    while self.compute_cost(self.x0+t*delta) > cost+alpha*t*torch.dot(g[0],delta):
+                        t *= beta
+                self.x0 = self.x0 + t * delta
+                print(self.x0[:2])
+            else:
+                print("Reach maximum inner loop.")
+
+
+            # update Lagrangian multipliers
+            ## current constraint violation
+            with torch.no_grad():
+                sol = torch.cat((torch.as_tensor(initial_state[:6], dtype=torch.float32), self.x0.detach().reshape(-1)), 0)
+                xs, us, x_gts = [], [], []
+
+                for k in range(1, self.Np + 1):
+                    u_sol = sol[8*k-2 : 8*k]
+                    x_sol = sol[8*k : 8*k+6]
+                    x_last = sol[8*(k-1) : 8*k-2]
+                    x_gt = self.step_forward(x_last, u_sol)
+
+                    us.append(u_sol) # (2,)
+                    xs.append(x_sol) # (6,)
+                    x_gts.append(x_gt) # (6,)
+                
+                xs = torch.cat(xs, 0)
+                x_gts = torch.cat(x_gts, 0)
+                us = torch.cat(us, 0)
+
+                ulbs = self.action_lb.repeat(self.Np).reshape(-1)
+                uubs = self.action_ub.repeat(self.Np).reshape(-1)
+
+                violation = x_gts - xs
+
+                violation_lb = ulbs - us
+                violation_ub = us - uubs
+
+                us_error = torch.abs(us - last_us).max()
+                last_us = us
+
+                max_violation = torch.max(torch.tensor([torch.abs(violation).max(), violation_lb.max(), violation_ub.max()]))
+
+                assert us.shape == (2*self.Np,)
+                assert violation.shape == (6*self.Np,)
+                assert self.lam.shape == (6*self.Np,)
+
+                alm_per_step["obj_aug_term"].append(torch.dot(self.lam, violation)
+                    + torch.dot(self.lam_lb, violation_lb)
+                    + torch.dot(self.lam_ub, violation_ub)
+                    + self.rho / 2. * (torch.sum(violation**2) 
+                                + torch.sum(torch.maximum(violation_lb, torch.zeros_like(violation_lb))**2)
+                                + torch.sum(torch.maximum(violation_ub, torch.zeros_like(violation_ub))**2)
+                    )
+                )
+                alm_per_step["obj_primal"].append(cost - alm_per_step["obj_aug_term"][-1])
+                alm_per_step["max_violation_dyanmics"].append(torch.abs(violation).max())
+                alm_per_step["max_violation_lb"].append(violation_lb.max())
+                alm_per_step["max_violation_ub"].append(violation_ub.max())
+
+                self.lam = self.lam + self.rho * violation
+                self.lam_lb = torch.maximum(self.lam_lb + self.rho * violation_lb, torch.zeros_like(self.lam_lb))
+                self.lam_ub = torch.maximum(self.lam_ub + self.rho * violation_ub, torch.zeros_like(self.lam_ub))
+                self.rho *= self.rho_amplifier
+
+                print(f"ALM iteration {alm_iter}: us_error {us_error:.6f}, max_violation {max_violation:.6f}")
+                print(f"lam: {self.lam.reshape(-1)[-5:]}, lam_lb: {self.lam_lb.reshape(-1)[:5]}, lam_ub: {self.lam_ub.reshape(-1)[:5]}")
+        else:
+            print(f"reach max iteration {max_lam_iter} for ALM")
             
+        # store per-step alm result
+        opt_result = {}
+        opt_result["num_iteration"] = alm_iter + 1
+        opt_result["u"] = sol[6:8]
+        opt_result["x"] = np.array(initial_state[0:6]).reshape(-1)
+        opt_result["x_ref"] = np.array(initial_state[6:9]).reshape(-1)
+        opt_result["x_next"] = np.array(x_sol[8:14]).reshape(-1)
+        opt_result["alm_process"] = alm_per_step
+
+        return sol[6:8], opt_result
+
